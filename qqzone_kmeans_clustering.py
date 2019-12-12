@@ -1,4 +1,5 @@
 ﻿import warnings
+from pytoolkit import TDWSQLProvider
 import copy
 import numpy as np
 import pandas as pd
@@ -119,17 +120,31 @@ def detect_outliers(df,n,features): #筛选异常值
     multiple_outliers=list(k for k,v in outlier_indices.items() if v>n)
     return multiple_outliers   
 	
+
 #计算tf_idf值，对热门功能进行惩戒
 def tf_idf(var):
     tf=data_tmp1[var]/data_tmp1['all_write_cnt']
     idf=np.log(data_tmp1.shape[0]/data_tmp1[data_tmp1[var]>0].shape[0])
     return tf*idf
 	
-	
-
 #数据读取
-paths='./file/用户分群.txt'
-data = pd.read_csv(paths, encoding='gbk')
+# 定义元数据信息
+meta_group, db_name, tb_name = '同乐', 'u_isd_qzone', 'f_qz_base_login_and_write_m'
+# 初始化TDWProvider，无需显示指定用户名和密码
+tdw = TDWSQLProvider(spark, db=db_name, group=meta_group)
+# # 提取表数据
+# mydf = tdw.table(tb_name).select('ftime', 'tag').limit(10).collect()
+# # 输出结果
+# mydf.show()
+
+# `sqlCtx`是内置的当前spark.sqlContext的引用，可以直接使用
+sqlCtx.registerDataFrameAsTable(tdw.table(tb_name), 'tb_name')
+# 使用SQL语句查询数据
+mydf = sqlCtx.sql('select * from tb_name where ftime=20191101')#.collect()
+# 输出结果
+# print(mydf)
+# mydf.show()
+data=pd.DataFrame(mydf.show())	
 pd.set_option('display.max_columns', 100)  ##设置显示列数
 pd.set_option('precision', 4)  ##设置小数点位数
 
