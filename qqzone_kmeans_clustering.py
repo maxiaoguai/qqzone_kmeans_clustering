@@ -1,20 +1,79 @@
-﻿import warnings
-from pytoolkit import TDWSQLProvider
-import copy
-import numpy as np
-import pandas as pd
-from sklearn.cluster import KMeans
-from collections import Counter
+﻿from pytoolkit import TDWSQLProvider,TableDesc,TableInfo,TDWUtil
+from pyspark.sql import SQLContext,Row
+from pyspark.sql.functions import lit,md5,concat,col,count,broadcast,variance,bround
+from pyspark.ml.evaluation import RegressionEvaluator
+from pyspark.ml.feature import StringIndexer,StringIndexerModel
+
+import xgboost as xgb
+from xgboost.sklearn import XGBClassifier,XGBRegressor
 from sklearn import metrics
-from sklearn import datasets
+from sklearn import linear_model
+from sklearn.model_selection import GridSearchCV,train_test_split
+from sklearn.metrics import mean_squared_error,r2_score
+from sklearn.datasets import load_boston
+
+from IPython.display import display
 import matplotlib.pyplot as plt
 import seaborn as sns
-from scipy import stats
+import numpy as np
+from scipy import sparse,stats
+import pandas as pd
+from operator import attrgetter
+from sys import getsizeof
+from math import sqrt
+import datetime
+import copy
+import seaborn as sns
+from collections import Counter
 from sklearn import preprocessing
-from sklearn.metrics import silhouette_samples,silhouette_score
 from sklearn.decomposition import PCA
-warnings.filterwarnings("ignore") #忽略告警信息
 
+sc._conf.set("spark.tdw.orcfile.datasource","false")
+sc._conf.set("spark.driver.maxResultSize","12g")
+print(sc.applicationId)
+print sc._conf.get('spark.driver.memory')
+print sc._conf.get('spark.driver.maxResultSize')
+
+
+# 定义元数据信息
+meta_group, db_name, tb_name = '同乐', 'u_isd_qzone', 'qqzone_user_clustering'
+# 初始化TDWProvider，无需显示指定用户名和密码
+tdw = TDWSQLProvider(spark, db=db_name, group=meta_group)
+# # 提取表数据
+# mydf = tdw.table(tb_name).select('ftime', 'tag').limit(10).collect()
+# # 输出结果
+# mydf.show()
+
+# `sqlCtx`是内置的当前spark.sqlContext的引用，可以直接使用
+sqlCtx.registerDataFrameAsTable(tdw.table(tb_name), 'tb_name')
+# 使用SQL语句查询数据
+# mydf = sqlCtx.sql('select * from tb_name where ftime=20191101')#.collect()
+mydf = sqlCtx.sql('select * from tb_name').toPandas()#.collect()
+
+
+#缺失数据用-1填补
+mydf.loc[mydf['age'].isnull(),'age']=mydf.loc[mydf['age'].isnull(),'age'].fillna(-1)
+
+def detect_outliers(df,n,features): #筛选异常值
+    """
+    Takes a dataframe df of features and returns a list of the indices
+    corresponding to the observations containing more than n outliers according
+    to the Tukey method.
+    """
+    outlier_indices=[]
+    for col in features:
+        Q1=np.percentile(df[col], 25)
+        Q3=np.percentile(df[col],75)
+        outlier_step=3*(Q3 - Q1)
+        outlier_list_col=df[df[col]>Q3+outlier_step].index
+        outlier_list_col=df[(df[col]<Q1-outlier_step)|(df[col]>Q3+outlier_step)].index
+        outlier_indices.extend(outlier_list_col)
+    outlier_indices=Counter(outlier_indices)        
+    multiple_outliers=list(k for k,v in outlier_indices.items() if v>n)
+    return multiple_outliers   
+
+Outliers_to_drop=detect_outliers(mydf,4,mydf.columns.tolist()[2:]) #异常值处理
+mydf=mydf.drop(Outliers_to_drop,axis=0).reset_index(drop=True)
 
 def data_desc(df_table):  #数据集描述
     t = []
@@ -55,154 +114,130 @@ def data_desc(df_table):  #数据集描述
     df_table1 = pd.DataFrame(t, columns=colnums)
     return df_table1
 	
-	
-def kmeans(data,k):
-    def _distance(p1,p2): #计算点之间的距离
-        tmp = np.sum((p1-p2)**2)
-        return np.sqrt(tmp)
-		
-    def _rand_center(data,k): #给定随机k个质心
-        n = data.shape[1] # 变量数
-        centroids = np.zeros((k,n)) 
-        for i in range(n):
-            dmin, dmax = np.min(data[:,i]), np.max(data[:,i])
-            centroids[:,i] = dmin + (dmax - dmin) * np.random.rand(k)
-        return centroids
-    
-    def _converged(centroids1, centroids2):
-        
-        # if centroids not changed, we say 'converged'
-         set1 = set([tuple(c) for c in centroids1])
-         set2 = set([tuple(c) for c in centroids2])
-         return (set1 == set2)
-        
-    
-    n = data.shape[0] #记录数
-    centroids = _rand_center(data,k)
-    label = np.zeros(n,dtype=np.int) # track the nearest centroid
-    assement = np.zeros(n) # for the assement of our model
-    converged = False
-    
-    while not converged:
-        old_centroids = np.copy(centroids)
-        for i in range(n):
-            #确定最近的质心并打标签
-            min_dist, min_index = np.inf, -1
-            for j in range(k):
-                dist = _distance(data[i],centroids[j])
-                if dist < min_dist:
-                    min_dist, min_index = dist, j
-                    label[i] = j
-            assement[i] = _distance(data[i],centroids[label[i]])**2
-        
-        # 更新质心
-        for m in range(k):
-            centroids[m] = np.mean(data[label==m],axis=0)
-        converged = _converged(old_centroids,centroids)    
-    return centroids, label, np.sum(assement)
-
-	
-def detect_outliers(df,n,features): #筛选异常值
-    """
-    Takes a dataframe df of features and returns a list of the indices
-    corresponding to the observations containing more than n outliers according
-    to the Tukey method.
-    """
-    outlier_indices=[]
-    for col in features:
-        Q1=np.percentile(df[col], 25)
-        Q3=np.percentile(df[col],75)
-        outlier_step=3*(Q3 - Q1)
-        outlier_list_col=df[df[col]>Q3+outlier_step].index
-        outlier_list_col=df[(df[col]<Q1-outlier_step)|(df[col]>Q3+outlier_step)].index
-        outlier_indices.extend(outlier_list_col)
-    outlier_indices=Counter(outlier_indices)        
-    multiple_outliers=list(k for k,v in outlier_indices.items() if v>n)
-    return multiple_outliers   
-	
-
-#计算tf_idf值，对热门功能进行惩戒
-def tf_idf(var):
-    tf=data_tmp1[var]/data_tmp1['all_write_cnt']
-    idf=np.log(data_tmp1.shape[0]/data_tmp1[data_tmp1[var]>0].shape[0])
-    return tf*idf
-	
-#数据读取
-# 定义元数据信息
-meta_group, db_name, tb_name = '同乐', 'u_isd_qzone', 'f_qz_base_login_and_write_m'
-# 初始化TDWProvider，无需显示指定用户名和密码
-tdw = TDWSQLProvider(spark, db=db_name, group=meta_group)
-# # 提取表数据
-# mydf = tdw.table(tb_name).select('ftime', 'tag').limit(10).collect()
-# # 输出结果
-# mydf.show()
-
-# `sqlCtx`是内置的当前spark.sqlContext的引用，可以直接使用
-sqlCtx.registerDataFrameAsTable(tdw.table(tb_name), 'tb_name')
-# 使用SQL语句查询数据
-mydf = sqlCtx.sql('select * from tb_name where ftime=20191101')#.collect()
-# 输出结果
-# print(mydf)
-# mydf.show()
-data=pd.DataFrame(mydf.show())	
-pd.set_option('display.max_columns', 100)  ##设置显示列数
-pd.set_option('precision', 4)  ##设置小数点位数
-
-#数据预处理
-var_name=['age','qq_age','all_write_cnt','zhaopian_num','shiping_num','shuoshuo_cnt','rizhi_cnt','fenxiang_cnt','liuyan_cnt','songli_cnt','dianzan_cnt','pinglun_cnt']
-data_tmp1=data.loc[data['all_write_days']>0,var_name]
-
-#缺失数据用-1填补
-data_tmp1.loc[data_tmp1['age'].isnull(),'age']=data_tmp1.loc[data_tmp1['age'].isnull(),'age'].fillna(-1)
-data_tmp1.loc[data_tmp1['qq_age'].isnull(),'qq_age']=data_tmp1.loc[data_tmp1['qq_age'].isnull(),'qq_age'].fillna(-1)
-
-data_desc(data_tmp1) #查看各变量缺失情况
-Outliers_to_drop=detect_outliers(data_tmp1,4,data_tmp1.columns.tolist()[2:]) #异常值处理
-# 'all_write_cnt','zhaopian_num','shiping_num'
-data_tmp1=data_tmp1.drop(Outliers_to_drop,axis=0).reset_index(drop=True)
-
-
 #将超过99.9分位的原始数据人工修改为99分位
-for var_name in data_tmp1.columns.tolist()[1:]:
-    p_99=np.percentile(data_tmp1[var_name], 99.9)
-    data_tmp1[var_name]=data_tmp1[var_name].apply(lambda x:p_99 if x>p_99 else x)
+for var_name in mydf.columns.tolist()[1:]:
+    p_99=np.percentile(mydf[var_name], 99.9)
+    mydf[var_name]=mydf[var_name].apply(lambda x:p_99 if x>p_99 else x)
 	
 #相关性检验
 plt.figure(figsize=(10, 8), dpi=80, edgecolor='k').add_subplot(1,1,1)
-sns.heatmap(data_tmp1.corr(),annot=True,cbar=True,cmap='RdGy',fmt = ".2f",center=0)
+sns.heatmap(mydf.corr(),annot=True,cbar=True,cmap='RdGy',fmt = ".2f",center=0)
+plt.show()
 
 #计算tf_idf值，对热门功能进行惩戒
-data_tmp2=copy.deepcopy(data_tmp1)
-for var in data_tmp2.columns.tolist()[2:]:
+def tf_idf(var):
+    tf=mydf[var]/mydf['all_write_cnt']
+    idf=np.log(mydf.shape[0]/mydf[mydf[var]>0].shape[0])
+    return tf*idf
+
+data_tmp2=copy.deepcopy(mydf)
+for var in data_tmp2.columns.tolist()[3:]:
     data_tmp2['pct_%s'%var]=tf_idf(var)
     data_tmp2.drop('%s'%var,inplace=True,axis=1) #删除部分变量
 data_tmp2.drop('all_write_cnt',inplace=True,axis=1) #删除部分变量
 
-
 #部分变量存在幂指分布
 fig = plt.figure(figsize=(10,8), dpi=80, facecolor='w', edgecolor='k')
 sns.set_style('darkgrid')
-# sns.distplot(data_tmp1['zhaopian_num'])
-sns.kdeplot(data_tmp1['shuoshuo_cnt'],color='black',shade=True,)
+sns.kdeplot(mydf['shuoshuo_cnt'],color='black',shade=True,)
+plt.show()
 
 #对部分幂指分布的用户进行log线性处理
-for var in data_tmp2.columns.tolist():
-    data_tmp2['%s_log'%var]=data_tmp2['%s'%var].map(lambda i:np.log10(i+2)) 
-    data_tmp2.drop('%s'%var,inplace=True,axis=1) #删除部分变量
-
+data_tmp1=copy.deepcopy(mydf)
+for var in data_tmp1.columns.tolist():
+    data_tmp1['%s_log'%var]=data_tmp1['%s'%var].map(lambda i:np.log10(i+2)) 
+    data_tmp1.drop('%s'%var,inplace=True,axis=1) #删除部分变量
+	
 #数据标准化
-data_tmp2=pd.DataFrame(preprocessing.scale(data_tmp2),columns=data_tmp2.columns)
+data_tmp2=pd.DataFrame(preprocessing.scale(data_tmp1),columns=data_tmp1.columns)
 
 #PCA降维
 pca=PCA(n_components=3)
-data_tmp1=pca.fit_transform(data_tmp1)
+data_tmp3=pca.fit_transform(data_tmp2)
+
+datMat=np.asmatrix(data_tmp3)
+
+
+
+def distEclud(vecA, vecB):
+    return sqrt(sum(power(vecA - vecB, 2))) # 计算欧式距离
+
+
+def randCent(dataSet, k): #随机选择k个质心
+    n = dataSet.shape[1]
+    centroids = np.mat(np.zeros((k,n))) #创建0矩阵
+    for j in range(n): #创建随机质心
+        minJ = min(dataSet[:,j]) 
+        rangeJ = float(max(dataSet[:,j]) - minJ)
+        centroids[:,j] = np.mat(minJ + rangeJ * np.random.rand(k,1))
+    return centroids
+
+
+def kMeans(dataSet, k, distMeas=distEclud, createCent=randCent):
+    m = dataSet.shape[0]
+    clusterAssment = np.mat(np.zeros((m,2)))
+    centroids = createCent(dataSet, k)
+    clusterChanged = True
+    while clusterChanged:
+        clusterChanged = False
+        for i in range(m): #寻找最近的质心
+            minDist = np.inf; minIndex = -1
+            for j in range(k):
+                distJI = distMeas(centroids[j,:],dataSet[i,:])
+                if distJI < minDist:
+                    minDist = distJI; minIndex = j
+            if clusterAssment[i,0] != minIndex: clusterChanged = True
+            clusterAssment[i,:] = minIndex,minDist**2
+#         print(centroids,len(centroids))
+        for cent in range(k): #更新质心位置
+            ptsInClust = dataSet[nonzero(clusterAssment[:,0].A==cent)[0]]#存储聚类结果
+            centroids[cent,:] = mean(ptsInClust, axis=0)  
+    return centroids, clusterAssment
+
+
+def biKmeans(dataSet, k, distMeas=distEclud):
+    m = shape(dataSet)[0]
+    clusterAssment = mat(zeros((m,2)))
+    centroid0 = mean(dataSet, axis=0).tolist()[0]
+    centList =[centroid0] #创建初始类
+    for j in range(m):
+        clusterAssment[j,1] = distMeas(mat(centroid0), dataSet[j,:])**2
+    while (len(centList) < k):
+        lowestSSE = inf
+        for i in range(len(centList)): #划分每一簇
+            ptsInCurrCluster = dataSet[nonzero(clusterAssment[:,0].A==i)[0],:] 
+            centroidMat, splitClustAss = kMeans(ptsInCurrCluster, 2, distMeas)
+            sseSplit = sum(splitClustAss[:,1])# 比较SSE的大小
+            sseNotSplit = sum(clusterAssment[nonzero(clusterAssment[:,0].A!=i)[0],1])
+#             print ("sseSplit, and notSplit: ",sseSplit,sseNotSplit)
+            if (sseSplit + sseNotSplit) < lowestSSE:
+                bestCentToSplit = i
+                bestNewCents = centroidMat
+                bestClustAss = splitClustAss.copy()
+                lowestSSE = sseSplit + sseNotSplit
+        bestClustAss[nonzero(bestClustAss[:,0].A == 1)[0],0] = len(centList) 
+        bestClustAss[nonzero(bestClustAss[:,0].A == 0)[0],0] = bestCentToSplit
+#         print('the bestCentToSplit is: ',bestCentToSplit)
+#         print('the len of bestClustAss is: ', len(bestClustAss))
+        centList[bestCentToSplit] = bestNewCents[0,:].tolist()[0] #更新簇的分配结果
+        centList.append(bestNewCents[1,:].tolist()[0])
+        clusterAssment[nonzero(clusterAssment[:,0].A == bestCentToSplit)[0],:]= bestClustAss#存储聚类结果及SSE值
+    return mat(centList), clusterAssment
+	
+	
+clustering_sse=[]
+for k in np.linspace(2,20,19).astype(int):
+    myCentroids,clustAssing=biKmeans(datMat,k)
+    clustering_sse.append(sum(clustAssing[:,1]))
 
 #通过SSE选择最佳K的取值
-distortions=[]
-for i in np.linspace(2,20,19).astype(int):
-    y_pred=KMeans(n_clusters=i, n_jobs = 4,random_state=9).fit(data_tmp3)
-    distortions.append(y_pred.inertia_)
-plt.plot(np.linspace(2,20,19).astype(int),distortions,linewidth=2)
+sns.set(style="darkgrid", palette="muted", color_codes=True) 
+# sns.set( palette="muted", color_codes=True)  
+plt.figure(figsize=(8,6),dpi=80,facecolor='w',edgecolor='k')
+sns.pointplot(np.linspace(2,20,19).astype(int),clustering_sse)
+plt.xlabel('K')
+plt.ylabel('SSE')
+plt.show()
 
 #通过轮廓系数判断聚类效果
 distortions=[]
@@ -211,35 +246,17 @@ for i in np.linspace(2,10,9).astype(int):
     distortions.append(silhouette_score(data_tmp3, y_pred))
 plt.plot(np.linspace(2,10,9).astype(int),distortions)  
 
+myCentroids,clustAssing=biKmeans(datMat,8)
 
-#选择最佳模型参数训练
-data_tmp1['y_pred']=KMeans(n_clusters=6, n_jobs = 4,random_state=9).fit_predict(data_tmp3)
-data_tmp2['y_pred']=KMeans(n_clusters=6, n_jobs = 4,random_state=9).fit_predict(data_tmp3)
-print(np.bincount(data_tmp1['y_pred'])*100/data_tmp1.shape[0]) #每类样本占比
-data_tmp1.groupby(['y_pred']).mean().reset_index()
-
-#kmeans容易陷入局部最优解，因此迭代10轮
-best_assement = np.inf
-best_centroids = None
-best_label = None
-
-for i in range(10):
-    centroids, label, assement = kmeans(data_tmp3,2)
-    if assement < best_assement:
-        best_assement = assement
-        best_centroids = centroids
-        best_label = label
-
-data0 = data_tmp3[best_label==0]
-data1 = data_tmp3[best_label==1]
+data_tmp2['y_pred']=map(int,clustAssing[:,0].A)
 
 
 #绘制聚类雷达图
-data_tmp1_gb=data_tmp1.groupby(['y_pred']).mean().reset_index()
-data_tmp1_gb_nm=data_desc(data_tmp1_gb.iloc[:,1:]).sort_values(['n_std'],ascending=False).iloc[0:5,:]['colums'].tolist()
+data_tmp1_gb=data_tmp2.groupby(['y_pred']).mean().reset_index()
+data_tmp1_gb_nm=data_desc(data_tmp1_gb.iloc[:,1:]).sort_values(['n_std'],ascending=False).iloc[0:8,:]['colums'].tolist()
 data_tmp1_gb=data_tmp1_gb[['y_pred']+data_tmp1_gb_nm]
 
-values_tmp1,angles_tmp1,cluster_result=[],[],np.unique(data_tmp1['y_pred'])
+values_tmp1,angles_tmp1,cluster_result=[],[],np.unique(data_tmp2['y_pred'])
 for i in cluster_result:
     feature=data_tmp1_gb.columns.tolist()[1:]
     values = np.array(data_tmp1_gb[data_tmp1_gb['y_pred']==i].iloc[:,1:]).tolist()[0]
@@ -257,7 +274,6 @@ ax.grid(True) # 添加网格线
 plt.legend(loc = 'best') # 设置图例
 plt.show() # 显示图形
 
-
 #绘制聚类结果图
 L1=[n[0] for n in data_tmp3]
 L2=[n[1] for n in data_tmp3]
@@ -265,9 +281,7 @@ plt.rcParams['axes.unicode_minus']=False
 plt.rc('font', family='SimHei', size=8)
 fig = plt.figure(figsize=(20,20), dpi=80, facecolor='w', edgecolor='k')
 p1 = plt.subplot(221)
-plt.title(u"Kmeans聚类 n=5")
-plt.scatter(L1,L2,c=data_tmp1['y_pred'],marker="s")
+plt.title(u"Kmeans聚类")
+plt.scatter(L1,L2,c=data_tmp2['y_pred'],marker="s")
 plt.sca(p1)
-
-
-
+plt.show()
